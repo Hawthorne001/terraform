@@ -56,7 +56,7 @@ func ValidateMoves(stmts []MoveStatement, rootCfg *configs.Config, declaredInsts
 		// both stmt.From and stmt.To always belong to the same statement.
 		fromMod, _ := stmt.From.ModuleCallTraversals()
 
-		for _, fromModInst := range declaredInsts.InstancesForModule(fromMod) {
+		for _, fromModInst := range declaredInsts.InstancesForModule(fromMod, false) {
 			absFrom := stmt.From.InModuleInstance(fromModInst)
 
 			absTo := stmt.To.InModuleInstance(fromModInst)
@@ -250,7 +250,7 @@ func movableObjectDeclRange(addr addrs.AbsMoveable, cfg *configs.Config) (tfdiag
 		// (NOTE: This assumes "addr" can never be the root module instance,
 		// because the root module is never moveable.)
 		parentAddr, callAddr := addr.Call()
-		modCfg := cfg.DescendentForInstance(parentAddr)
+		modCfg := cfg.DescendantForInstance(parentAddr)
 		if modCfg == nil {
 			return tfdiags.SourceRange{}, false
 		}
@@ -271,7 +271,7 @@ func movableObjectDeclRange(addr addrs.AbsMoveable, cfg *configs.Config) (tfdiag
 			return tfdiags.SourceRangeFromHCL(call.DeclRange), true
 		}
 	case addrs.AbsModuleCall:
-		modCfg := cfg.DescendentForInstance(addr.Module)
+		modCfg := cfg.DescendantForInstance(addr.Module)
 		if modCfg == nil {
 			return tfdiags.SourceRange{}, false
 		}
@@ -281,7 +281,7 @@ func movableObjectDeclRange(addr addrs.AbsMoveable, cfg *configs.Config) (tfdiag
 		}
 		return tfdiags.SourceRangeFromHCL(call.DeclRange), true
 	case addrs.AbsResourceInstance:
-		modCfg := cfg.DescendentForInstance(addr.Module)
+		modCfg := cfg.DescendantForInstance(addr.Module)
 		if modCfg == nil {
 			return tfdiags.SourceRange{}, false
 		}
@@ -302,7 +302,7 @@ func movableObjectDeclRange(addr addrs.AbsMoveable, cfg *configs.Config) (tfdiag
 			return tfdiags.SourceRangeFromHCL(rc.DeclRange), true
 		}
 	case addrs.AbsResource:
-		modCfg := cfg.DescendentForInstance(addr.Module)
+		modCfg := cfg.DescendantForInstance(addr.Module)
 		if modCfg == nil {
 			return tfdiags.SourceRange{}, false
 		}

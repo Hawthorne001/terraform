@@ -13,6 +13,8 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang/marks"
+	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/objchange"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -28,10 +30,11 @@ import (
 //
 // This is the partial-expanded equivalent of NodePlannableResourceInstance.
 type nodePlannablePartialExpandedResource struct {
-	addr             addrs.PartialExpandedResource
-	config           *configs.Resource
-	resolvedProvider addrs.AbsProviderConfig
-	skipPlanChanges  bool
+	addr              addrs.PartialExpandedResource
+	config            *configs.Resource
+	resolvedProvider  addrs.AbsProviderConfig
+	skipPlanChanges   bool
+	preDestroyRefresh bool
 }
 
 var (
@@ -85,13 +88,36 @@ func (n *nodePlannablePartialExpandedResource) Execute(ctx EvalContext, op walkO
 	//
 	log.Printf("[TRACE] nodePlannablePartialExpandedResource: checking all of %s", n.addr.String())
 
-	var placeholderVal cty.Value
+	switch op {
+	case walkPlanDestroy:
+		// During destroy plans, we never include partial-expanded resources.
+		// We're only interested in fully-expanded resources that we know we
+		// need to destroy.
+		return nil
+	case walkPlan:
+		if n.preDestroyRefresh || n.skipPlanChanges {
+			// During any kind of refresh, we also don't really care about
+			// partial resources. We only care about the fully-expanded resources
+			// already in state, so we don't need to plan partial resources.
+			return nil
+		}
+
+	default:
+		// Continue with the normal planning process
+	}
+
 	var diags tfdiags.Diagnostics
 	switch n.addr.Resource().Mode {
 	case addrs.ManagedResourceMode:
-		placeholderVal, diags = n.managedResourceExecute(ctx)
+		change, changeDiags := n.managedResourceExecute(ctx)
+		diags = diags.Append(changeDiags)
+		ctx.Deferrals().ReportResourceExpansionDeferred(n.addr, change)
 	case addrs.DataResourceMode:
-		placeholderVal, diags = n.dataResourceExecute(ctx)
+		change, changeDiags := n.dataResourceExecute(ctx)
+		diags = diags.Append(changeDiags)
+		ctx.Deferrals().ReportDataSourceExpansionDeferred(n.addr, change)
+	case addrs.EphemeralResourceMode:
+		ctx.Deferrals().ReportEphemeralResourceExpansionDeferred(n.addr)
 	default:
 		panic(fmt.Errorf("unsupported resource mode %s", n.config.Mode))
 	}
@@ -99,11 +125,11 @@ func (n *nodePlannablePartialExpandedResource) Execute(ctx EvalContext, op walkO
 	// Registering this allows downstream resources that depend on this one
 	// to know that they need to defer themselves too, in order to preserve
 	// correct dependency order.
-	ctx.Deferrals().ReportResourceExpansionDeferred(n.addr, placeholderVal)
 	return diags
 }
 
-func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalContext) (cty.Value, tfdiags.Diagnostics) {
+// Logic here mirrors (*NodePlannableResourceInstance).managedResourceExecute.
+func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalContext) (*plans.ResourceInstanceChange, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
 	// We cannot fully plan partial-expanded resources because we don't know
@@ -114,22 +140,36 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 	// to shorten the iterative journey, so nothing here actually contributes
 	// new actions to the plan.
 
+	// We'll make a basic change for us to use as a placeholder for the time
+	// being, and we'll populate it as we get more info.
+	change := plans.ResourceInstanceChange{
+		Addr:         n.addr.UnknownResourceInstance(),
+		ProviderAddr: n.resolvedProvider,
+		Change: plans.Change{
+			// We don't actually know the action, but we simulate the plan later
+			// as a create action so we'll use that here too.
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.DynamicVal, // This will be populated later
+		},
+	}
+
 	provider, providerSchema, err := getProvider(ctx, n.resolvedProvider)
 	diags = diags.Append(err)
 	if diags.HasErrors() {
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
 	diags = diags.Append(validateSelfRef(n.addr.Resource(), n.config.Config, providerSchema))
 	if diags.HasErrors() {
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
 	schema, _ := providerSchema.SchemaForResourceAddr(n.addr.Resource())
 	if schema == nil {
 		// Should be caught during validation, so we don't bother with a pretty error here
 		diags = diags.Append(fmt.Errorf("provider does not support resource type %q", n.addr.Resource().Type))
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
 	// TODO: Normal managed resource planning
@@ -149,37 +189,15 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 		// not really anything else to do here, since we can only refresh
 		// specific known resource instances (which another graph node should
 		// handle), so we'll just return early.
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
-	// Because we don't know the instance keys yet, we'll be evaluating using
-	// suitable unknown values for count.index, each.key, and each.value
-	// so that anything that varies between the instances will be unknown
-	// but we can still check the arguments that they all have in common.
-	var keyData instances.RepetitionData
-	switch {
-	case n.config.ForEach != nil:
-		// We don't actually know the `for_each` type here, but we do at least
-		// know it's for_each.
-		keyData = instances.UnknownForEachRepetitionData(cty.DynamicPseudoType)
-	case n.config.Count != nil:
-		keyData = instances.UnknownCountRepetitionData
-	default:
-		// If we get here then we're presumably a single-instance resource
-		// inside a multi-instance module whose instances aren't known yet,
-		// and so we'll evaluate without any of the repetition symbols to
-		// still generate the usual errors if someone tries to use them here.
-		keyData = instances.RepetitionData{
-			CountIndex: cty.NilVal,
-			EachKey:    cty.NilVal,
-			EachValue:  cty.NilVal,
-		}
-	}
+	keyData := n.keyData()
 
 	configVal, _, configDiags := ctx.EvaluateBlock(n.config.Config, schema, nil, keyData)
 	diags = diags.Append(configDiags)
 	if configDiags.HasErrors() {
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
 	unmarkedConfigVal, _ := configVal.UnmarkDeep()
@@ -191,7 +209,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 	)
 	diags = diags.Append(validateResp.Diagnostics.InConfigBody(n.config.Config, n.addr.String()))
 	if diags.HasErrors() {
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
 	unmarkedConfigVal, unmarkedPaths := configVal.UnmarkDeepWithPaths()
@@ -217,7 +235,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 	})
 	diags = diags.Append(resp.Diagnostics.InConfigBody(n.config.Config, n.addr.String()))
 	if diags.HasErrors() {
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
 	plannedNewVal := resp.PlannedState
@@ -239,7 +257,7 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 		))
 	}
 	if diags.HasErrors() {
-		return cty.DynamicVal, diags
+		return &change, diags
 	}
 
 	if errs := objchange.AssertPlanValid(schema, priorVal, unmarkedConfigVal, plannedNewVal); len(errs) > 0 {
@@ -269,27 +287,118 @@ func (n *nodePlannablePartialExpandedResource) managedResourceExecute(ctx EvalCo
 					),
 				))
 			}
-			return cty.DynamicVal, diags
+			return &change, diags
 		}
 	}
 
 	// We need to combine the dynamic marks with the static marks implied by
 	// the provider's schema.
-	unmarkedPaths = dedupePathValueMarks(append(unmarkedPaths, schema.ValueMarks(plannedNewVal, nil)...))
-	if len(unmarkedPaths) > 0 {
-		plannedNewVal = plannedNewVal.MarkWithPaths(unmarkedPaths)
+	plannedNewVal = plannedNewVal.MarkWithPaths(unmarkedPaths)
+	if sensitivePaths := schema.SensitivePaths(plannedNewVal, nil); len(sensitivePaths) != 0 {
+		plannedNewVal = marks.MarkPaths(plannedNewVal, marks.Sensitive, sensitivePaths)
 	}
 
-	return plannedNewVal, diags
+	change.After = plannedNewVal
+	change.Private = resp.PlannedPrivate
+	return &change, diags
 }
 
-func (n *nodePlannablePartialExpandedResource) dataResourceExecute(ctx EvalContext) (cty.Value, tfdiags.Diagnostics) {
+// Logic here mirrors a combination of (*NodePlannableResourceInstance).dataResourceExecute
+// and (*NodeAbstractResourceInstance).planDataSource.
+func (n *nodePlannablePartialExpandedResource) dataResourceExecute(ctx EvalContext) (*plans.ResourceInstanceChange, tfdiags.Diagnostics) {
 	var diags tfdiags.Diagnostics
 
-	// TODO: Ideally we should do an approximation of the normal data resource
-	// planning process similar to what we're doing for managed resources in
-	// managedResourceExecute, but we'll save that for a later phase of this
-	// experiment since managed resources are enough to start getting real
-	// experience with this new evaluation approach.
-	return cty.DynamicVal, diags
+	// Start with a basic change, then attempt to fill in the After value.
+	change := plans.ResourceInstanceChange{
+		Addr:         n.addr.UnknownResourceInstance(),
+		ProviderAddr: n.resolvedProvider,
+		Change: plans.Change{
+			// Data sources can only Read.
+			Action: plans.Read,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.DynamicVal, // hoping to fill this in
+		},
+		// For now, this is the default reason for deferred data source reads.
+		// It's _basically_ the truth!
+		ActionReason: plans.ResourceInstanceReadBecauseConfigUnknown,
+	}
+
+	// Unlike with the managed path, we don't ask the provider to *do* anything.
+	_, providerSchema, err := getProvider(ctx, n.resolvedProvider)
+	diags = diags.Append(err)
+	if diags.HasErrors() {
+		return &change, diags
+	}
+
+	diags = diags.Append(validateSelfRef(n.addr.Resource(), n.config.Config, providerSchema))
+	if diags.HasErrors() {
+		return &change, diags
+	}
+
+	// This is the point where we switch to mirroring logic from
+	// NodeAbstractResourceInstance's planDataSource. If you were curious.
+
+	schema, _ := providerSchema.SchemaForResourceAddr(n.addr.Resource())
+	if schema == nil {
+		// Should be caught during validation, so we don't bother with a pretty error here
+		diags = diags.Append(fmt.Errorf("provider does not support resource type %q", n.addr.Resource().Type))
+		return &change, diags
+	}
+
+	keyData := n.keyData()
+
+	configVal, _, configDiags := ctx.EvaluateBlock(n.config.Config, schema, nil, keyData)
+	diags = diags.Append(configDiags)
+	if configDiags.HasErrors() {
+		return &change, diags
+	}
+
+	// Note: We're deliberately not doing anything special for nested-in-a-check
+	// data sources. (*NodeAbstractResourceInstance).planDataSource has some
+	// special handling for these, but it's founded on the assumption that we're
+	// going to be able to actually read the data source. (Specifically: it
+	// blocks propagation of errors on read during plan, and ensures that we get
+	// a planned Read to execute during apply even if the data source would have
+	// been readable earlier.) But we're getting deferred anyway, so none of
+	// that is relevant on this path. 👍🏼
+
+	// Unlike the managed path, we don't call provider.ValidateResourceConfig;
+	// Terraform handles planning for data sources without hands-on input from
+	// the provider. BTW, this is about where we start mirroring planDataSource's
+	// logic for a data source with unknown config, which is sort of what we
+	// are, after all.
+	unmarkedConfigVal, unmarkedPaths := configVal.UnmarkDeepWithPaths()
+	proposedNewVal := objchange.PlannedDataResourceObject(schema, unmarkedConfigVal)
+	proposedNewVal = proposedNewVal.MarkWithPaths(unmarkedPaths)
+	if sensitivePaths := schema.SensitivePaths(proposedNewVal, nil); len(sensitivePaths) != 0 {
+		proposedNewVal = marks.MarkPaths(proposedNewVal, marks.Sensitive, sensitivePaths)
+	}
+	// yay we made it
+	change.After = proposedNewVal
+	return &change, diags
+}
+
+// keyData returns suitable unknown values for count.index, each.key, and
+// each.value, based on what we know of the resource config. When evaluating
+// with this unknown key data, anything that varies between the instances will
+// be unknown but we can still check the arguments that they all have in common.
+func (n *nodePlannablePartialExpandedResource) keyData() instances.RepetitionData {
+	switch {
+	case n.config.ForEach != nil:
+		// We don't actually know the `for_each` type here, but we do at least
+		// know it's for_each.
+		return instances.UnknownForEachRepetitionData(cty.DynamicPseudoType)
+	case n.config.Count != nil:
+		return instances.UnknownCountRepetitionData
+	default:
+		// If we get here then we're presumably a single-instance resource
+		// inside a multi-instance module whose instances aren't known yet,
+		// and so we'll evaluate without any of the repetition symbols to
+		// still generate the usual errors if someone tries to use them here.
+		return instances.RepetitionData{
+			CountIndex: cty.NilVal,
+			EachKey:    cty.NilVal,
+			EachValue:  cty.NilVal,
+		}
+	}
 }

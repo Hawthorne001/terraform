@@ -13,7 +13,7 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/dag"
-	"github.com/hashicorp/terraform/internal/lang"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -62,32 +62,28 @@ func (n *nodeExpandLocal) ReferenceableAddrs() []addrs.Referenceable {
 
 // GraphNodeReferencer
 func (n *nodeExpandLocal) References() []*addrs.Reference {
-	refs, _ := lang.ReferencesInExpr(addrs.ParseRef, n.Config.Expr)
+	refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, n.Config.Expr)
 	return refs
 }
 
 func (n *nodeExpandLocal) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diagnostics) {
 	var g Graph
 	expander := ctx.InstanceExpander()
-	forEachModuleInstance(
-		expander, n.Module,
-		func(module addrs.ModuleInstance) {
-			o := &NodeLocal{
-				Addr:   n.Addr.Absolute(module),
-				Config: n.Config,
-			}
-			log.Printf("[TRACE] Expanding local: adding %s as %T", o.Addr.String(), o)
-			g.Add(o)
-		},
-		func(pem addrs.PartialExpandedModule) {
-			o := &nodeLocalInPartialModule{
-				Addr:   addrs.ObjectInPartialExpandedModule(pem, n.Addr),
-				Config: n.Config,
-			}
-			log.Printf("[TRACE] Expanding local: adding placeholder for all %s as %T", o.Addr.String(), o)
-			g.Add(o)
-		},
-	)
+	forEachModuleInstance(expander, n.Module, false, func(module addrs.ModuleInstance) {
+		o := &NodeLocal{
+			Addr:   n.Addr.Absolute(module),
+			Config: n.Config,
+		}
+		log.Printf("[TRACE] Expanding local: adding %s as %T", o.Addr.String(), o)
+		g.Add(o)
+	}, func(pem addrs.PartialExpandedModule) {
+		o := &nodeLocalInPartialModule{
+			Addr:   addrs.ObjectInPartialExpandedModule(pem, n.Addr),
+			Config: n.Config,
+		}
+		log.Printf("[TRACE] Expanding local: adding placeholder for all %s as %T", o.Addr.String(), o)
+		g.Add(o)
+	})
 	addRootNodeToGraph(&g)
 	return &g, nil
 }
@@ -136,7 +132,7 @@ func (n *NodeLocal) ReferenceableAddrs() []addrs.Referenceable {
 
 // GraphNodeReferencer
 func (n *NodeLocal) References() []*addrs.Reference {
-	refs, _ := lang.ReferencesInExpr(addrs.ParseRef, n.Config.Expr)
+	refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, n.Config.Expr)
 	return refs
 }
 
@@ -220,7 +216,7 @@ func evaluateLocalValue(config *configs.Local, localAddr addrs.LocalValue, addrS
 
 	// We ignore diags here because any problems we might find will be found
 	// again in EvaluateExpr below.
-	refs, _ := lang.ReferencesInExpr(addrs.ParseRef, expr)
+	refs, _ := langrefs.ReferencesInExpr(addrs.ParseRef, expr)
 	for _, ref := range refs {
 		if ref.Subject == localAddr {
 			diags = diags.Append(&hcl.Diagnostic{

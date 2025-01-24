@@ -17,6 +17,7 @@ import (
 	"github.com/hashicorp/terraform/internal/plans/deferring"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/refactoring"
+	"github.com/hashicorp/terraform/internal/resources/ephemeral"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -44,6 +45,9 @@ type graphWalkOpts struct {
 	// always take into account what walk type it's dealing with.
 	ExternalProviderConfigs map[addrs.RootProviderConfig]providers.Interface
 
+	// DeferralAlowed indicates that the current runtime supports deferred actions.
+	DeferralAllowed bool
+
 	// ExternalDependencyDeferred indicates that something that this entire
 	// configuration depends on (outside the view of this modules runtime)
 	// has deferred changes, and therefore we must treat _all_ actions
@@ -70,6 +74,10 @@ type graphWalkOpts struct {
 	MoveResults refactoring.MoveResults
 
 	ProviderFuncResults *providers.FunctionResults
+
+	// Forget if set to true will cause the plan to forget all resources. This is
+	// only allowd in the context of a destroy plan.
+	Forget bool
 }
 
 func (c *Context) walk(graph *Graph, operation walkOperation, opts *graphWalkOpts) (*ContextGraphWalker, tfdiags.Diagnostics) {
@@ -165,10 +173,7 @@ func (c *Context) graphWalker(graph *Graph, operation walkOperation, opts *graph
 		}
 	}
 
-	// We'll produce a derived graph that only includes the static resource
-	// blocks, since we need that for deferral tracking.
-	resourceGraph := graph.ResourceGraph()
-	deferred := deferring.NewDeferred(resourceGraph)
+	deferred := deferring.NewDeferred(opts.DeferralAllowed)
 	if opts.ExternalDependencyDeferred {
 		deferred.SetExternalDependencyDeferred()
 	}
@@ -182,14 +187,16 @@ func (c *Context) graphWalker(graph *Graph, operation walkOperation, opts *graph
 		PrevRunState:            prevRunState,
 		Changes:                 changes.SyncWrapper(),
 		NamedValues:             namedvals.NewState(),
+		EphemeralResources:      ephemeral.NewResources(),
 		Deferrals:               deferred,
 		Checks:                  checkState,
-		InstanceExpander:        instances.NewExpander(),
+		InstanceExpander:        instances.NewExpander(opts.Overrides),
 		ExternalProviderConfigs: opts.ExternalProviderConfigs,
 		MoveResults:             opts.MoveResults,
 		Operation:               operation,
 		StopContext:             c.runContext,
 		PlanTimestamp:           opts.PlanTimeTimestamp,
 		providerFuncResults:     opts.ProviderFuncResults,
+		Forget:                  opts.Forget,
 	}
 }

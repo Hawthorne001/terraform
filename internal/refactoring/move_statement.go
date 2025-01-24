@@ -64,27 +64,29 @@ func findMoveStatements(cfg *configs.Config, into []MoveStatement) []MoveStateme
 
 		// We have the statement, let's see if we should attach a provider to
 		// it.
-
 		if toResource, ok := mc.To.ConfigMoveable(addrs.RootModule).(addrs.ConfigResource); ok {
 			// Only attach providers if we are moving resources, and we attach
 			// the to resource provider from the config. We can retrieve the
 			// from resource provider from the state later.
+			modCfg := cfg.Descendant(toResource.Module)
+			// It's possible that multiple refactorings have left a moved block
+			// that points to a module which no longer exists. This may also be
+			// a mistake, but the user will see the unexpected deletion in the
+			// plan if it is.
+			if modCfg != nil {
+				resourceConfig := modCfg.Module.ResourceByAddr(toResource.Resource)
+				if resourceConfig != nil {
+					// Check the target resource config actually exists before we
+					// try and extract the provider from them.
 
-			resourceConfig := cfg.Descendent(toResource.Module).Module.ResourceByAddr(toResource.Resource)
-			if resourceConfig != nil {
+					stmt.Provider = &addrs.AbsProviderConfig{
+						Module:   modAddr,
+						Provider: resourceConfig.Provider,
+					}
 
-				// Check the target resource config actually exists before we
-				// try and extract the provider from them. If the resource
-				// doesn't exist in config, then we'll get a validation error
-				// later on anyway.
-
-				stmt.Provider = &addrs.AbsProviderConfig{
-					Module:   modAddr,
-					Provider: resourceConfig.Provider,
-				}
-
-				if resourceConfig.ProviderConfigRef != nil {
-					stmt.Provider.Alias = resourceConfig.ProviderConfigRef.Alias
+					if resourceConfig.ProviderConfigRef != nil {
+						stmt.Provider.Alias = resourceConfig.ProviderConfigRef.Alias
+					}
 				}
 			}
 		}
@@ -178,7 +180,7 @@ func impliedMoveStatements(cfg *configs.Config, prevRunState *states.State, expl
 				// zero as the one to retain.
 				if !haveMoveStatementForResource(rAddr, explicitStmts) {
 
-					resource := cfg.Descendent(addrs.RootModule).Module.ResourceByAddr(rAddr.Resource)
+					resource := cfg.Descendant(addrs.RootModule).Module.ResourceByAddr(rAddr.Resource)
 					provider := &addrs.AbsProviderConfig{
 						Module:   rAddr.Module.Module(),
 						Provider: resource.Provider,

@@ -4,12 +4,14 @@
 package terraform
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
+	"github.com/hashicorp/terraform/internal/lang/ephemeral"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
@@ -120,6 +122,24 @@ func upgradeResourceState(addr addrs.AbsResourceInstance, provider providers.Int
 		return nil, diags
 	}
 
+	// Check for any write-only attributes that have non-null values
+	writeOnlyDiags := ephemeral.ValidateWriteOnlyAttributes(
+		"Invalid resource state upgrade",
+		func(path cty.Path) string {
+			return fmt.Sprintf(
+				"While attempting to upgrade state of resource %s, the provider %q returned a value for the write-only attribute \"%s%s\". Write-only attributes cannot be read back from the provider. This is a bug in the provider, which should be reported in the provider's own issue tracker.",
+				addr, providerType, addr, tfdiags.FormatCtyPath(path),
+			)
+		},
+		newValue,
+		currentSchema,
+	)
+	diags = diags.Append(writeOnlyDiags)
+
+	if writeOnlyDiags.HasErrors() {
+		return nil, diags
+	}
+
 	new, err := src.CompleteUpgrade(newValue, currentSchema.ImpliedType(), uint64(currentVersion))
 	if err != nil {
 		// We already checked for type conformance above, so getting into this
@@ -136,8 +156,12 @@ func upgradeResourceState(addr addrs.AbsResourceInstance, provider providers.Int
 // stripRemovedStateAttributes deletes any attributes no longer present in the
 // schema, so that the json can be correctly decoded.
 func stripRemovedStateAttributes(state []byte, ty cty.Type) []byte {
+	// we must use json.Number to avoid changing the precision of cty.Number values
+	decoder := json.NewDecoder(bytes.NewReader(state))
+	decoder.UseNumber()
+
 	jsonMap := map[string]interface{}{}
-	err := json.Unmarshal(state, &jsonMap)
+	err := decoder.Decode(&jsonMap)
 	if err != nil {
 		// we just log any errors here, and let the normal decode process catch
 		// invalid JSON.

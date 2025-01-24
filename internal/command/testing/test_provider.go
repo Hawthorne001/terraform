@@ -63,6 +63,31 @@ var (
 				},
 			},
 		},
+		EphemeralResourceTypes: map[string]providers.Schema{
+			"test_ephemeral_resource": {
+				Block: &configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"value": {
+							Type:     cty.String,
+							Computed: true,
+						},
+					},
+				},
+			},
+		},
+		Functions: map[string]providers.FunctionDecl{
+			"is_true": {
+				Parameters: []providers.FunctionParam{
+					{
+						Name:               "input",
+						Type:               cty.Bool,
+						AllowNullValue:     false,
+						AllowUnknownValues: false,
+					},
+				},
+				ReturnType: cty.Bool,
+			},
+		},
 	}
 )
 
@@ -96,6 +121,9 @@ func NewProvider(store *ResourceStore) *TestProvider {
 	provider.Provider.ApplyResourceChangeFn = provider.ApplyResourceChange
 	provider.Provider.ReadResourceFn = provider.ReadResource
 	provider.Provider.ReadDataSourceFn = provider.ReadDataSource
+	provider.Provider.CallFunctionFn = provider.CallFunction
+	provider.Provider.OpenEphemeralResourceFn = provider.OpenEphemeralResource
+	provider.Provider.CloseEphemeralResourceFn = provider.CloseEphemeralResource
 
 	return provider
 }
@@ -311,6 +339,30 @@ func (provider *TestProvider) ReadDataSource(request providers.ReadDataSourceReq
 		State:       resource,
 		Diagnostics: diags,
 	}
+}
+
+func (provider *TestProvider) CallFunction(request providers.CallFunctionRequest) providers.CallFunctionResponse {
+	switch request.FunctionName {
+	case "is_true":
+		return providers.CallFunctionResponse{
+			Result: request.Arguments[0],
+		}
+	default:
+		return providers.CallFunctionResponse{
+			Err: fmt.Errorf("unknown function %q", request.FunctionName),
+		}
+	}
+}
+
+func (provider *TestProvider) OpenEphemeralResource(providers.OpenEphemeralResourceRequest) (resp providers.OpenEphemeralResourceResponse) {
+	resp.Result = cty.ObjectVal(map[string]cty.Value{
+		"value": cty.StringVal("bar"),
+	})
+	return resp
+}
+
+func (provider *TestProvider) CloseEphemeralResource(providers.CloseEphemeralResourceRequest) (resp providers.CloseEphemeralResourceResponse) {
+	return resp
 }
 
 // ResourceStore manages a set of cty.Value resources that can be shared between

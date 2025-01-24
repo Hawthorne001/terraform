@@ -536,7 +536,7 @@ func loadRefactoringFixture(t *testing.T, dir string) (*configs.Config, instance
 		t.Fatalf("failed to load root module: %s", diags.Error())
 	}
 
-	expander := instances.NewExpander()
+	expander := instances.NewExpander(nil)
 	staticPopulateExpanderModule(t, rootCfg, addrs.RootModuleInstance, expander)
 	return rootCfg, expander.AllInstances()
 }
@@ -544,7 +544,7 @@ func loadRefactoringFixture(t *testing.T, dir string) (*configs.Config, instance
 func staticPopulateExpanderModule(t *testing.T, rootCfg *configs.Config, moduleAddr addrs.ModuleInstance, expander *instances.Expander) {
 	t.Helper()
 
-	modCfg := rootCfg.DescendentForInstance(moduleAddr)
+	modCfg := rootCfg.DescendantForInstance(moduleAddr)
 	if modCfg == nil {
 		t.Fatalf("no configuration for %s", moduleAddr)
 	}
@@ -597,7 +597,7 @@ func staticPopulateExpanderModule(t *testing.T, rootCfg *configs.Config, moduleA
 
 		// We need to recursively analyze the child modules too.
 		calledMod := modCfg.Path.Child(call.Name)
-		for _, inst := range expander.ExpandModule(calledMod) {
+		for _, inst := range expander.ExpandModule(calledMod, false) {
 			staticPopulateExpanderModule(t, rootCfg, inst, expander)
 		}
 	}

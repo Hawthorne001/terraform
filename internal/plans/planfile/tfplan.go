@@ -6,7 +6,6 @@ package planfile
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"time"
 
 	"github.com/zclconf/go-cty/cty"
@@ -14,12 +13,13 @@ import (
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/checks"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/lang/globalref"
-	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/plans/planproto"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
+	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/hashicorp/terraform/version"
 )
 
@@ -38,7 +38,7 @@ const tfplanFilename = "tfplan"
 // a plan file, which is stored in a special file in the archive called
 // "tfplan".
 func readTfplan(r io.Reader) (*plans.Plan, error) {
-	src, err := ioutil.ReadAll(r)
+	src, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -59,27 +59,22 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 
 	plan := &plans.Plan{
 		VariableValues: map[string]plans.DynamicValue{},
-		Changes: &plans.Changes{
+		Changes: &plans.ChangesSrc{
 			Outputs:   []*plans.OutputChangeSrc{},
 			Resources: []*plans.ResourceInstanceChangeSrc{},
 		},
-		DriftedResources: []*plans.ResourceInstanceChangeSrc{},
-		Checks:           &states.CheckResults{},
+		DriftedResources:  []*plans.ResourceInstanceChangeSrc{},
+		DeferredResources: []*plans.DeferredResourceInstanceChangeSrc{},
+		Checks:            &states.CheckResults{},
 	}
 
 	plan.Applyable = rawPlan.Applyable
 	plan.Complete = rawPlan.Complete
 	plan.Errored = rawPlan.Errored
 
-	switch rawPlan.UiMode {
-	case planproto.Mode_NORMAL:
-		plan.UIMode = plans.NormalMode
-	case planproto.Mode_DESTROY:
-		plan.UIMode = plans.DestroyMode
-	case planproto.Mode_REFRESH_ONLY:
-		plan.UIMode = plans.RefreshOnlyMode
-	default:
-		return nil, fmt.Errorf("plan has invalid mode %s", rawPlan.UiMode)
+	plan.UIMode, err = planproto.FromMode(rawPlan.UiMode)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, rawOC := range rawPlan.OutputChanges {
@@ -106,7 +101,7 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 	plan.Checks = checkResults
 
 	for _, rawRC := range rawPlan.ResourceChanges {
-		change, err := resourceChangeFromTfplan(rawRC)
+		change, err := resourceChangeFromTfplan(rawRC, addrs.ParseAbsResourceInstanceStr)
 		if err != nil {
 			// errors from resourceChangeFromTfplan already include context
 			return nil, err
@@ -116,13 +111,22 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 	}
 
 	for _, rawRC := range rawPlan.ResourceDrift {
-		change, err := resourceChangeFromTfplan(rawRC)
+		change, err := resourceChangeFromTfplan(rawRC, addrs.ParseAbsResourceInstanceStr)
 		if err != nil {
 			// errors from resourceChangeFromTfplan already include context
 			return nil, err
 		}
 
 		plan.DriftedResources = append(plan.DriftedResources, change)
+	}
+
+	for _, rawDC := range rawPlan.DeferredChanges {
+		change, err := deferredChangeFromTfplan(rawDC)
+		if err != nil {
+			return nil, err
+		}
+
+		plan.DeferredResources = append(plan.DeferredResources, change)
 	}
 
 	for _, rawRA := range rawPlan.RelevantAttributes {
@@ -155,6 +159,13 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 			return nil, fmt.Errorf("invalid value for input variable %q: %s", name, err)
 		}
 		plan.VariableValues[name] = val
+	}
+
+	if len(rawPlan.ApplyTimeVariables) != 0 {
+		plan.ApplyTimeVariables = collections.NewSetCmp[string]()
+		for _, name := range rawPlan.ApplyTimeVariables {
+			plan.ApplyTimeVariables.Add(name)
+		}
 	}
 
 	for _, hash := range rawPlan.ProviderFunctionResults {
@@ -193,10 +204,19 @@ func readTfplan(r io.Reader) (*plans.Plan, error) {
 // This is used by the stackplan package, which includes planproto messages
 // in its own wire format while using a different overall container.
 func ResourceChangeFromProto(rawChange *planproto.ResourceInstanceChange) (*plans.ResourceInstanceChangeSrc, error) {
-	return resourceChangeFromTfplan(rawChange)
+	return resourceChangeFromTfplan(rawChange, addrs.ParseAbsResourceInstanceStr)
 }
 
-func resourceChangeFromTfplan(rawChange *planproto.ResourceInstanceChange) (*plans.ResourceInstanceChangeSrc, error) {
+// DeferredResourceChangeFromProto decodes an isolated deferred resource
+// instance change from its representation as a protocol buffers message.
+//
+// This the same as ResourceChangeFromProto but internally allows for splat
+// addresses, which are not allowed outside deferred changes.
+func DeferredResourceChangeFromProto(rawChange *planproto.ResourceInstanceChange) (*plans.ResourceInstanceChangeSrc, error) {
+	return resourceChangeFromTfplan(rawChange, addrs.ParsePartialResourceInstanceStr)
+}
+
+func resourceChangeFromTfplan(rawChange *planproto.ResourceInstanceChange, parseAddr func(str string) (addrs.AbsResourceInstance, tfdiags.Diagnostics)) (*plans.ResourceInstanceChangeSrc, error) {
 	if rawChange == nil {
 		// Should never happen in practice, since protobuf can't represent
 		// a nil value in a list.
@@ -213,13 +233,13 @@ func resourceChangeFromTfplan(rawChange *planproto.ResourceInstanceChange) (*pla
 		return nil, fmt.Errorf("no instance address for resource instance change; perhaps this plan was created by a different version of Terraform?")
 	}
 
-	instAddr, diags := addrs.ParseAbsResourceInstanceStr(rawChange.Addr)
+	instAddr, diags := parseAddr(rawChange.Addr)
 	if diags.HasErrors() {
 		return nil, fmt.Errorf("invalid resource instance address %q: %w", rawChange.Addr, diags.Err())
 	}
 	prevRunAddr := instAddr
 	if rawChange.PrevRunAddr != "" {
-		prevRunAddr, diags = addrs.ParseAbsResourceInstanceStr(rawChange.PrevRunAddr)
+		prevRunAddr, diags = parseAddr(rawChange.PrevRunAddr)
 		if diags.HasErrors() {
 			return nil, fmt.Errorf("invalid resource instance previous run address %q: %w", rawChange.PrevRunAddr, diags.Err())
 		}
@@ -401,25 +421,25 @@ func changeFromTfplan(rawChange *planproto.Change) (*plans.ChangeSrc, error) {
 
 	if rawChange.Importing != nil {
 		ret.Importing = &plans.ImportingSrc{
-			ID: rawChange.Importing.Id,
+			ID:      rawChange.Importing.Id,
+			Unknown: rawChange.Importing.Unknown,
 		}
 	}
 	ret.GeneratedConfig = rawChange.GeneratedConfig
 
-	sensitive := cty.NewValueMarks(marks.Sensitive)
-	beforeValMarks, err := pathValueMarksFromTfplan(rawChange.BeforeSensitivePaths, sensitive)
+	beforeValSensitiveAttrs, err := pathsFromTfplan(rawChange.BeforeSensitivePaths)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode before sensitive paths: %s", err)
 	}
-	afterValMarks, err := pathValueMarksFromTfplan(rawChange.AfterSensitivePaths, sensitive)
+	afterValSensitiveAttrs, err := pathsFromTfplan(rawChange.AfterSensitivePaths)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode after sensitive paths: %s", err)
 	}
-	if len(beforeValMarks) > 0 {
-		ret.BeforeValMarks = beforeValMarks
+	if len(beforeValSensitiveAttrs) > 0 {
+		ret.BeforeSensitivePaths = beforeValSensitiveAttrs
 	}
-	if len(afterValMarks) > 0 {
-		ret.AfterValMarks = afterValMarks
+	if len(afterValSensitiveAttrs) > 0 {
+		ret.AfterSensitivePaths = afterValSensitiveAttrs
 	}
 
 	return ret, nil
@@ -431,6 +451,44 @@ func valueFromTfplan(rawV *planproto.DynamicValue) (plans.DynamicValue, error) {
 	}
 
 	return plans.DynamicValue(rawV.Msgpack), nil
+}
+
+func deferredChangeFromTfplan(dc *planproto.DeferredResourceInstanceChange) (*plans.DeferredResourceInstanceChangeSrc, error) {
+	if dc == nil {
+		return nil, fmt.Errorf("deferred change object is absent")
+	}
+
+	change, err := resourceChangeFromTfplan(dc.Change, addrs.ParsePartialResourceInstanceStr)
+	if err != nil {
+		return nil, err
+	}
+
+	reason, err := DeferredReasonFromProto(dc.Deferred.Reason)
+	if err != nil {
+		return nil, err
+	}
+
+	return &plans.DeferredResourceInstanceChangeSrc{
+		DeferredReason: reason,
+		ChangeSrc:      change,
+	}, nil
+}
+
+func DeferredReasonFromProto(reason planproto.DeferredReason) (providers.DeferredReason, error) {
+	switch reason {
+	case planproto.DeferredReason_INSTANCE_COUNT_UNKNOWN:
+		return providers.DeferredReasonInstanceCountUnknown, nil
+	case planproto.DeferredReason_RESOURCE_CONFIG_UNKNOWN:
+		return providers.DeferredReasonResourceConfigUnknown, nil
+	case planproto.DeferredReason_PROVIDER_CONFIG_UNKNOWN:
+		return providers.DeferredReasonProviderConfigUnknown, nil
+	case planproto.DeferredReason_ABSENT_PREREQ:
+		return providers.DeferredReasonAbsentPrereq, nil
+	case planproto.DeferredReason_DEFERRED_PREREQ:
+		return providers.DeferredReasonDeferredPrereq, nil
+	default:
+		return providers.DeferredReasonInvalid, fmt.Errorf("invalid deferred reason %s", reason)
+	}
 }
 
 // writeTfplan serializes the given plan into the protobuf-based format used
@@ -452,21 +510,17 @@ func writeTfplan(plan *plans.Plan, w io.Writer) error {
 		CheckResults:    []*planproto.CheckResults{},
 		ResourceChanges: []*planproto.ResourceInstanceChange{},
 		ResourceDrift:   []*planproto.ResourceInstanceChange{},
+		DeferredChanges: []*planproto.DeferredResourceInstanceChange{},
 	}
 
 	rawPlan.Applyable = plan.Applyable
 	rawPlan.Complete = plan.Complete
 	rawPlan.Errored = plan.Errored
 
-	switch plan.UIMode {
-	case plans.NormalMode:
-		rawPlan.UiMode = planproto.Mode_NORMAL
-	case plans.DestroyMode:
-		rawPlan.UiMode = planproto.Mode_DESTROY
-	case plans.RefreshOnlyMode:
-		rawPlan.UiMode = planproto.Mode_REFRESH_ONLY
-	default:
-		return fmt.Errorf("plan has unsupported mode %s", plan.UIMode)
+	var err error
+	rawPlan.UiMode, err = planproto.NewMode(plan.UIMode)
+	if err != nil {
+		return err
 	}
 
 	for _, oc := range plan.Changes.Outputs {
@@ -516,6 +570,14 @@ func writeTfplan(plan *plans.Plan, w io.Writer) error {
 		rawPlan.ResourceDrift = append(rawPlan.ResourceDrift, rawRC)
 	}
 
+	for _, dc := range plan.DeferredResources {
+		rawDC, err := deferredChangeToTfplan(dc)
+		if err != nil {
+			return err
+		}
+		rawPlan.DeferredChanges = append(rawPlan.DeferredChanges, rawDC)
+	}
+
 	for _, ra := range plan.RelevantAttributes {
 		rawRA, err := resourceAttrToTfplan(ra)
 		if err != nil {
@@ -534,6 +596,12 @@ func writeTfplan(plan *plans.Plan, w io.Writer) error {
 
 	for name, val := range plan.VariableValues {
 		rawPlan.Variables[name] = valueToTfplan(val)
+	}
+	if plan.ApplyTimeVariables.Len() != 0 {
+		rawPlan.ApplyTimeVariables = make([]string, 0, plan.ApplyTimeVariables.Len())
+		for name := range plan.ApplyTimeVariables.All() {
+			rawPlan.ApplyTimeVariables = append(rawPlan.ApplyTimeVariables, name)
+		}
 	}
 
 	for _, hash := range plan.ProviderFunctionResults {
@@ -731,11 +799,11 @@ func changeToTfplan(change *plans.ChangeSrc) (*planproto.Change, error) {
 	before := valueToTfplan(change.Before)
 	after := valueToTfplan(change.After)
 
-	beforeSensitivePaths, err := pathValueMarksToTfplan(change.BeforeValMarks)
+	beforeSensitivePaths, err := pathsToTfplan(change.BeforeSensitivePaths)
 	if err != nil {
 		return nil, err
 	}
-	afterSensitivePaths, err := pathValueMarksToTfplan(change.AfterValMarks)
+	afterSensitivePaths, err := pathsToTfplan(change.AfterSensitivePaths)
 	if err != nil {
 		return nil, err
 	}
@@ -744,7 +812,8 @@ func changeToTfplan(change *plans.ChangeSrc) (*planproto.Change, error) {
 
 	if change.Importing != nil {
 		ret.Importing = &planproto.Importing{
-			Id: change.Importing.ID,
+			Id:      change.Importing.ID,
+			Unknown: change.Importing.Unknown,
 		}
 
 	}
@@ -785,25 +854,28 @@ func valueToTfplan(val plans.DynamicValue) *planproto.DynamicValue {
 	return planproto.NewPlanDynamicValue(val)
 }
 
-func pathValueMarksFromTfplan(paths []*planproto.Path, marks cty.ValueMarks) ([]cty.PathValueMarks, error) {
-	ret := make([]cty.PathValueMarks, 0, len(paths))
+func pathsFromTfplan(paths []*planproto.Path) ([]cty.Path, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	ret := make([]cty.Path, 0, len(paths))
 	for _, p := range paths {
 		path, err := pathFromTfplan(p)
 		if err != nil {
 			return nil, err
 		}
-		ret = append(ret, cty.PathValueMarks{
-			Path:  path,
-			Marks: marks,
-		})
+		ret = append(ret, path)
 	}
 	return ret, nil
 }
 
-func pathValueMarksToTfplan(pvm []cty.PathValueMarks) ([]*planproto.Path, error) {
-	ret := make([]*planproto.Path, 0, len(pvm))
-	for _, p := range pvm {
-		path, err := pathToTfplan(p.Path)
+func pathsToTfplan(paths []cty.Path) ([]*planproto.Path, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	ret := make([]*planproto.Path, 0, len(paths))
+	for _, p := range paths {
+		path, err := pathToTfplan(p)
 		if err != nil {
 			return nil, err
 		}
@@ -853,6 +925,42 @@ func pathFromTfplan(path *planproto.Path) (cty.Path, error) {
 
 func pathToTfplan(path cty.Path) (*planproto.Path, error) {
 	return planproto.NewPath(path)
+}
+
+func deferredChangeToTfplan(dc *plans.DeferredResourceInstanceChangeSrc) (*planproto.DeferredResourceInstanceChange, error) {
+	change, err := resourceChangeToTfplan(dc.ChangeSrc)
+	if err != nil {
+		return nil, err
+	}
+
+	reason, err := DeferredReasonToProto(dc.DeferredReason)
+	if err != nil {
+		return nil, err
+	}
+
+	return &planproto.DeferredResourceInstanceChange{
+		Change: change,
+		Deferred: &planproto.Deferred{
+			Reason: reason,
+		},
+	}, nil
+}
+
+func DeferredReasonToProto(reason providers.DeferredReason) (planproto.DeferredReason, error) {
+	switch reason {
+	case providers.DeferredReasonInstanceCountUnknown:
+		return planproto.DeferredReason_INSTANCE_COUNT_UNKNOWN, nil
+	case providers.DeferredReasonResourceConfigUnknown:
+		return planproto.DeferredReason_RESOURCE_CONFIG_UNKNOWN, nil
+	case providers.DeferredReasonProviderConfigUnknown:
+		return planproto.DeferredReason_PROVIDER_CONFIG_UNKNOWN, nil
+	case providers.DeferredReasonAbsentPrereq:
+		return planproto.DeferredReason_ABSENT_PREREQ, nil
+	case providers.DeferredReasonDeferredPrereq:
+		return planproto.DeferredReason_DEFERRED_PREREQ, nil
+	default:
+		return planproto.DeferredReason_INVALID, fmt.Errorf("invalid deferred reason %s", reason)
+	}
 }
 
 // CheckResultsFromPlanProto decodes a slice of check results from their protobuf

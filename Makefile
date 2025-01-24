@@ -20,6 +20,10 @@ fmtcheck:
 importscheck:
 	"$(CURDIR)/scripts/goimportscheck.sh"
 
+vetcheck:
+	@echo "==> Checking that the code complies with go vet requirements"
+	@go vet ./...
+
 staticcheck:
 	"$(CURDIR)/scripts/staticcheck.sh"
 
@@ -31,6 +35,9 @@ copyright:
 
 copyrightfix:
 	"$(CURDIR)/scripts/copyright.sh"
+
+syncdeps:
+	"$(CURDIR)/scripts/syncdeps.sh"
 
 # Run this if working on the website locally to run in watch mode.
 website:
@@ -49,4 +56,4 @@ website/build-local:
 # under parallel conditions.
 .NOTPARALLEL:
 
-.PHONY: fmtcheck importscheck generate protobuf staticcheck website website/local website/build-local
+.PHONY: fmtcheck importscheck vetcheck generate protobuf staticcheck syncdeps website website/local website/build-local

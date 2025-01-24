@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/instances"
 	"github.com/hashicorp/terraform/internal/lang/blocktoattr"
+	"github.com/hashicorp/terraform/internal/lang/langrefs"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
@@ -32,7 +33,7 @@ func (s *Scope) ExpandBlock(body hcl.Body, schema *configschema.Block) (hcl.Body
 	spec := schema.DecoderSpec()
 
 	traversals := dynblock.ExpandVariablesHCLDec(body, spec)
-	refs, diags := References(s.ParseRef, traversals)
+	refs, diags := langrefs.References(s.ParseRef, traversals)
 
 	ctx, ctxDiags := s.EvalContext(refs)
 	diags = diags.Append(ctxDiags)
@@ -53,7 +54,7 @@ func (s *Scope) ExpandBlock(body hcl.Body, schema *configschema.Block) (hcl.Body
 func (s *Scope) EvalBlock(body hcl.Body, schema *configschema.Block) (cty.Value, tfdiags.Diagnostics) {
 	spec := schema.DecoderSpec()
 
-	refs, diags := ReferencesInBlock(s.ParseRef, body, schema)
+	refs, diags := langrefs.ReferencesInBlock(s.ParseRef, body, schema)
 
 	ctx, ctxDiags := s.EvalContext(refs)
 	diags = diags.Append(ctxDiags)
@@ -100,7 +101,7 @@ func (s *Scope) EvalSelfBlock(body hcl.Body, self cty.Value, schema *configschem
 		})
 	}
 
-	refs, refDiags := References(s.ParseRef, hcldec.Variables(body, spec))
+	refs, refDiags := langrefs.References(s.ParseRef, hcldec.Variables(body, spec))
 	diags = diags.Append(refDiags)
 
 	terraformAttrs := map[string]cty.Value{}
@@ -165,7 +166,7 @@ func (s *Scope) EvalSelfBlock(body hcl.Body, self cty.Value, schema *configschem
 // If the returned diagnostics contains errors then the result may be
 // incomplete, but will always be of the requested type.
 func (s *Scope) EvalExpr(expr hcl.Expression, wantType cty.Type) (cty.Value, tfdiags.Diagnostics) {
-	refs, diags := ReferencesInExpr(s.ParseRef, expr)
+	refs, diags := langrefs.ReferencesInExpr(s.ParseRef, expr)
 
 	ctx, ctxDiags := s.EvalContext(refs)
 	diags = diags.Append(ctxDiags)
@@ -282,6 +283,7 @@ func (s *Scope) evalContext(refs []*addrs.Reference, selfAddr addrs.Referenceabl
 	// that's redundant in the process of populating our values map.
 	dataResources := map[string]map[string]cty.Value{}
 	managedResources := map[string]map[string]cty.Value{}
+	ephemeralResources := map[string]map[string]cty.Value{}
 	wholeModules := map[string]cty.Value{}
 	inputVariables := map[string]cty.Value{}
 	localValues := map[string]cty.Value{}
@@ -364,6 +366,8 @@ func (s *Scope) evalContext(refs []*addrs.Reference, selfAddr addrs.Referenceabl
 				into = managedResources
 			case addrs.DataResourceMode:
 				into = dataResources
+			case addrs.EphemeralResourceMode:
+				into = ephemeralResources
 			default:
 				panic(fmt.Errorf("unsupported ResourceMode %s", subj.Mode))
 			}
@@ -442,7 +446,7 @@ func (s *Scope) evalContext(refs []*addrs.Reference, selfAddr addrs.Referenceabl
 		vals[k] = v
 	}
 	vals["resource"] = cty.ObjectVal(buildResourceObjects(managedResources))
-
+	vals["ephemeral"] = cty.ObjectVal(buildResourceObjects(ephemeralResources))
 	vals["data"] = cty.ObjectVal(buildResourceObjects(dataResources))
 	vals["module"] = cty.ObjectVal(wholeModules)
 	vals["var"] = cty.ObjectVal(inputVariables)

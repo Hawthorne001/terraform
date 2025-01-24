@@ -377,7 +377,7 @@ func TestShow_planWithForceReplaceChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := testPlan(t)
-	plan.Changes.SyncWrapper().AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
+	plan.Changes.AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
 		Addr: addrs.Resource{
 			Mode: addrs.ManagedResourceMode,
 			Type: "test_instance",
@@ -558,10 +558,12 @@ func TestShow_json_output(t *testing.T) {
 
 			// init
 			ui := new(cli.MockUi)
+			view, _ := testView(t)
 			ic := &InitCommand{
 				Meta: Meta{
 					testingOverrides: metaOverridesForProvider(p),
 					Ui:               ui,
+					View:             view,
 					ProviderSource:   providerSource,
 				},
 			}
@@ -666,10 +668,12 @@ func TestShow_json_output_sensitive(t *testing.T) {
 
 	// init
 	ui := new(cli.MockUi)
+	view, _ := testView(t)
 	ic := &InitCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
 			Ui:               ui,
+			View:             view,
 			ProviderSource:   providerSource,
 		},
 	}
@@ -759,10 +763,12 @@ func TestShow_json_output_conditions_refresh_only(t *testing.T) {
 
 	// init
 	ui := new(cli.MockUi)
+	view, _ := testView(t)
 	ic := &InitCommand{
 		Meta: Meta{
 			testingOverrides: metaOverridesForProvider(p),
 			Ui:               ui,
+			View:             view,
 			ProviderSource:   providerSource,
 		},
 	}
@@ -868,10 +874,12 @@ func TestShow_json_output_state(t *testing.T) {
 
 			// init
 			ui := new(cli.MockUi)
+			view, _ := testView(t)
 			ic := &InitCommand{
 				Meta: Meta{
 					testingOverrides: metaOverridesForProvider(p),
 					Ui:               ui,
+					View:             view,
 					ProviderSource:   providerSource,
 				},
 			}
@@ -1171,7 +1179,7 @@ func showFixturePlanFile(t *testing.T, action plans.Action) string {
 		t.Fatal(err)
 	}
 	plan := testPlan(t)
-	plan.Changes.SyncWrapper().AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
+	plan.Changes.AppendResourceInstanceChange(&plans.ResourceInstanceChangeSrc{
 		Addr: addrs.Resource{
 			Mode: addrs.ManagedResourceMode,
 			Type: "test_instance",

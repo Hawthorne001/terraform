@@ -111,6 +111,13 @@ null -> jsonencode(
     )
 `,
 		},
+		"primitive_create_fake_json": {
+			diff: computed.Diff{
+				Renderer: Primitive(nil, "[\"hello\"] and some more", cty.String),
+				Action:   plans.Create,
+			},
+			expected: `"[\"hello\"] and some more"`,
+		},
 		"primitive_create_null_string": {
 			diff: computed.Diff{
 				Renderer: Primitive(nil, nil, cty.String),
@@ -425,6 +432,13 @@ jsonencode(
 				Action: plans.Update,
 			},
 			expected: "0 -> (known after apply)",
+		},
+		"computed_update_from_null": {
+			diff: computed.Diff{
+				Renderer: Unknown(computed.Diff{}),
+				Action:   plans.Update,
+			},
+			expected: "(known after apply)",
 		},
 		"computed_create_forces_replacement": {
 			diff: computed.Diff{

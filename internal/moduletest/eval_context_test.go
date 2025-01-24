@@ -5,6 +5,7 @@ package moduletest
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,7 +63,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state: states.BuildState(func(state *states.SyncState) {
 				state.SetResourceInstanceCurrent(
@@ -126,7 +127,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state: states.BuildState(func(state *states.SyncState) {
 				state.SetResourceInstanceCurrent(
@@ -187,7 +188,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state: states.BuildState(func(state *states.SyncState) {
 				state.SetResourceInstanceCurrent(
@@ -254,7 +255,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state: states.BuildState(func(state *states.SyncState) {
 				state.SetResourceInstanceCurrent(
@@ -325,7 +326,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state: states.NewState(),
 			variables: terraform.InputValues{
@@ -366,7 +367,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state: states.NewState(),
 			variables: terraform.InputValues{
@@ -430,7 +431,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 					})
 			}),
 			plan: &plans.Plan{
-				Changes: &plans.Changes{
+				Changes: &plans.ChangesSrc{
 					Resources: []*plans.ResourceInstanceChangeSrc{
 						{
 							Addr: addrs.Resource{
@@ -509,7 +510,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 					})
 			}),
 			plan: &plans.Plan{
-				Changes: &plans.Changes{
+				Changes: &plans.ChangesSrc{
 					Resources: []*plans.ResourceInstanceChangeSrc{
 						{
 							Addr: addrs.Resource{
@@ -576,7 +577,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state: states.BuildState(func(state *states.SyncState) {
 				state.SetResourceInstanceCurrent(
@@ -635,7 +636,7 @@ func TestEvalContext_Evaluate(t *testing.T) {
 				`,
 			},
 			plan: &plans.Plan{
-				Changes: plans.NewChanges(),
+				Changes: plans.NewChangesSrc(),
 			},
 			state:          states.NewState(),
 			provider:       &testing_provider.MockProvider{},
@@ -643,6 +644,57 @@ func TestEvalContext_Evaluate(t *testing.T) {
 			expectedOutputs: cty.ObjectVal(map[string]cty.Value{
 				"foo": cty.StringVal("foo value"),
 				"bar": cty.StringVal("bar value"),
+			}),
+		},
+		"provider_functions": {
+			configs: map[string]string{
+				"main.tf": `
+				    terraform {
+                      required_providers {
+						test = {
+						  source = "hashicorp/test"
+                        }
+                      }
+                    }
+					output "true" {
+						value = true
+					}
+				`,
+				"main.tftest.hcl": `
+					run "test_case" {
+						assert {
+							condition = provider::test::true() == output.true
+							error_message = "invalid value"
+						}
+					}
+					`,
+			},
+			plan: &plans.Plan{
+				Changes: plans.NewChangesSrc(),
+			},
+			state: states.NewState(),
+			provider: &testing_provider.MockProvider{
+				GetProviderSchemaResponse: &providers.GetProviderSchemaResponse{
+					Functions: map[string]providers.FunctionDecl{
+						"true": {
+							ReturnType: cty.Bool,
+						},
+					},
+				},
+				CallFunctionFn: func(request providers.CallFunctionRequest) providers.CallFunctionResponse {
+					if request.FunctionName != "true" {
+						return providers.CallFunctionResponse{
+							Err: errors.New("unexpected function call"),
+						}
+					}
+					return providers.CallFunctionResponse{
+						Result: cty.True,
+					}
+				},
+			},
+			expectedStatus: Pass,
+			expectedOutputs: cty.ObjectVal(map[string]cty.Value{
+				"true": cty.True,
 			}),
 		},
 	}

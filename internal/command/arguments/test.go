@@ -11,7 +11,7 @@ import (
 // Test represents the command-line arguments for the test command.
 type Test struct {
 	// CloudRunSource specifies the remote private module that this test run
-	// should execute against in a remote Terraform Cloud run.
+	// should execute against in a remote HCP Terraform run.
 	CloudRunSource string
 
 	// Filter contains a list of test files to execute. If empty, all test files
@@ -50,7 +50,7 @@ func ParseTest(args []string) (*Test, tfdiags.Diagnostics) {
 
 	var jsonOutput bool
 	cmdFlags := extendedFlagSet("test", nil, nil, test.Vars)
-	cmdFlags.Var((*flagStringSlice)(&test.Filter), "filter", "filter")
+	cmdFlags.Var((*FlagStringSlice)(&test.Filter), "filter", "filter")
 	cmdFlags.StringVar(&test.TestDirectory, "test-directory", configs.DefaultTestDirectory, "test-directory")
 	cmdFlags.BoolVar(&jsonOutput, "json", false, "json")
 	cmdFlags.StringVar(&test.JUnitXMLFile, "junit-xml", "", "junit-xml")
@@ -64,6 +64,13 @@ func ParseTest(args []string) (*Test, tfdiags.Diagnostics) {
 			tfdiags.Error,
 			"Failed to parse command-line flags",
 			err.Error()))
+	}
+
+	if len(test.JUnitXMLFile) > 0 && len(test.CloudRunSource) > 0 {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Incompatible command-line flags",
+			"The -junit-xml option is currently not compatible with remote test execution via the -cloud-run flag. If you are interested in JUnit XML output for remotely-executed tests please open an issue in GitHub."))
 	}
 
 	switch {
